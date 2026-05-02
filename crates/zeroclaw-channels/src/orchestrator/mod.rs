@@ -23,6 +23,8 @@ pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
 pub use crate::bluesky::BlueskyChannel;
+#[cfg(feature = "channel-brick")]
+pub use crate::brick::BrickChannel;
 pub use crate::clawdtalk::ClawdTalkChannel;
 pub use crate::dingtalk::DingTalkChannel;
 pub use crate::discord::DiscordChannel;
@@ -763,7 +765,14 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+    // Brick fork: enable model-switch handling for the Brick channel so
+    // apps/os can send hidden `model_set` frames that get translated into
+    // `/model hint:<id>` synthetic commands by `brick.rs`. Without this,
+    // the orchestrator drops the `/model` text before dispatch.
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "slack" | "brick"
+    )
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -4428,10 +4437,23 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
+        // Brick fork: build the BrickChannel by id ("brick"). cfg-gated end-to-end.
+        #[cfg(feature = "channel-brick")]
+        "brick" => {
+            let bc = config
+                .channels
+                .brick
+                .as_ref()
+                .context("Brick channel is not configured")?;
+            Ok(Arc::new(BrickChannel::new(
+                bc.socket_path.clone(),
+                bc.max_connections,
+            )))
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call, brick"
         ),
     }
 }
@@ -5154,6 +5176,24 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("Webhook channel configured but disabled (enabled = false)");
+        }
+    }
+
+    // Brick fork: local WS bridge for the Brick OS Node.js process. Mirrors
+    // the unconditional webhook block above, but cfg-gated end-to-end so a
+    // build without `--features channel-brick` doesn't pull the trait impl.
+    #[cfg(feature = "channel-brick")]
+    if let Some(ref bc) = config.channels.brick {
+        if bc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Brick",
+                channel: Arc::new(BrickChannel::new(
+                    bc.socket_path.clone(),
+                    bc.max_connections,
+                )),
+            });
+        } else {
+            tracing::info!("Brick channel configured but disabled (enabled = false)");
         }
     }
 

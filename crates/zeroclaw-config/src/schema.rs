@@ -6684,6 +6684,13 @@ pub struct ChannelsConfig {
     #[cfg(feature = "channel-nostr")]
     #[nested]
     pub nostr: Option<NostrConfig>,
+    /// Brick OS local-bridge channel configuration. Owned by the Brick fork
+    /// at <https://github.com/the-tokenry/zeroclaw>; cfg-gated end-to-end
+    /// behind `channel-brick`. See `vendor/PATCHES.md` in the brick repo
+    /// for the full divergence registry.
+    #[cfg(feature = "channel-brick")]
+    #[nested]
+    pub brick: Option<BrickConfig>,
     /// ClawdTalk voice channel configuration.
     #[nested]
     pub clawdtalk: Option<crate::scattered_types::ClawdTalkConfig>,
@@ -6857,6 +6864,11 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.nostr.as_ref())),
                 self.nostr.is_some(),
             ),
+            #[cfg(feature = "channel-brick")]
+            (
+                Box::new(ConfigWrapper::new(self.brick.as_ref())),
+                self.brick.is_some(),
+            ),
             (
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
@@ -6930,6 +6942,8 @@ impl Default for ChannelsConfig {
             mochat: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
+            #[cfg(feature = "channel-brick")]
+            brick: None,
             clawdtalk: None,
             reddit: None,
             bluesky: None,
@@ -8991,6 +9005,62 @@ impl ChannelConfig for NostrConfig {
     fn desc() -> &'static str {
         "Nostr DMs"
     }
+}
+
+// ── Brick fork: BrickConfig ─────────────────────────────────────────────
+//
+// Brick OS local-bridge channel. Hosts a unix-socket WS server consumed by
+// the Brick OS Node.js process. Cfg-gated end-to-end behind `channel-brick`
+// — pattern matches `NostrConfig` above. Owned by the Brick fork at
+// <https://github.com/the-tokenry/zeroclaw>; never intended to merge upstream.
+
+#[cfg(feature = "channel-brick")]
+#[derive(Debug, Clone, Deserialize, Serialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.brick"]
+pub struct BrickConfig {
+    /// Whether this channel is active. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the unix domain socket. Created mode 0660, owned by the
+    /// daemon's user — apps/os must run as the same user (or in the same
+    /// group) to connect. Default `/run/brick/zeroclaw.sock`.
+    #[serde(default = "default_brick_socket_path")]
+    pub socket_path: String,
+    /// Soft cap on concurrent apps/os WebSocket connections. Default `4`.
+    #[serde(default = "default_brick_max_connections")]
+    pub max_connections: u32,
+}
+
+#[cfg(feature = "channel-brick")]
+impl Default for BrickConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: default_brick_socket_path(),
+            max_connections: default_brick_max_connections(),
+        }
+    }
+}
+
+#[cfg(feature = "channel-brick")]
+impl ChannelConfig for BrickConfig {
+    fn name() -> &'static str {
+        "Brick"
+    }
+    fn desc() -> &'static str {
+        "Brick OS local bridge"
+    }
+}
+
+#[cfg(feature = "channel-brick")]
+fn default_brick_socket_path() -> String {
+    "/run/brick/zeroclaw.sock".into()
+}
+
+#[cfg(feature = "channel-brick")]
+fn default_brick_max_connections() -> u32 {
+    4
 }
 
 #[cfg(feature = "channel-nostr")]
@@ -12303,6 +12373,8 @@ auto_save = true
                 mochat: None,
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
+                #[cfg(feature = "channel-brick")]
+                brick: None,
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
@@ -13467,6 +13539,8 @@ allowed_users = ["@u:matrix.org"]
             mochat: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
+            #[cfg(feature = "channel-brick")]
+            brick: None,
             clawdtalk: None,
             reddit: None,
             bluesky: None,
@@ -13849,6 +13923,8 @@ bot_token = "xoxb-tok"
             mochat: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
+            #[cfg(feature = "channel-brick")]
+            brick: None,
             clawdtalk: None,
             reddit: None,
             bluesky: None,

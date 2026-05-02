@@ -118,6 +118,9 @@ channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
+# Brick fork — local WS bridge over a unix socket. Forwards to
+# zeroclaw-config/channel-brick for the matching schema gate.
+channel-brick = ["zeroclaw-config/channel-brick"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }

@@ -233,24 +233,51 @@ mime_guess = { version = "2", optional = true }
 libc = "0.2"
 
 [features]
+# Brick fork: default features pull `agent-runtime-full` so upstream-style
+# integration builds keep exercising the full dependency graph. Production
+# builds pin `--no-default-features --features "agent-runtime,gateway,
+# observability-prometheus,channel-brick"`, which selects the trimmed
+# `agent-runtime` below.
 default = [
-    "agent-runtime",
+    "agent-runtime-full",
     "gateway",
     "tui-onboarding",
     "observability-prometheus",
     "schema-export",
 ]
 
-# The full agent runtime — agent loop, channels, tools, all subsystems.
-# Without this, you get the kernel: config + providers + memory + CLI chat.
-# Gateway and TUI onboarding are opt-in separately (included in `default`).
+# Brick fork (trimmed): the production runtime feature. Keeps the literal
+# `agent-runtime` cfg name because zeroclaw source tree uses
+# `#[cfg(feature = "agent-runtime")]` throughout the daemon, channels,
+# health, service, and security modules. Removing third-party chat-channel
+# optional deps (matrix-sdk, lettre+mail-parser+async-imap, ratatui+
+# crossterm, etc.) shrinks the production binary substantially.
+#
+# `tokio-tungstenite` stays because (a) `zeroclaw-channels` depends on it
+# unconditionally and (b) BrickChannel itself uses WebSocket framing.
+# `rustls` + friends stay because main.rs unconditionally calls
+# `rustls::crypto::ring::default_provider().install_default()` under
+# `#[cfg(feature = "agent-runtime")]`. Stripping them would break the
+# binary at build time.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
+    "dep:tokio-tungstenite",
+    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types",
+    "dep:tokio-rustls", "dep:webpki-roots",
+]
+
+# Brick fork: upstream-compatible "fat" runtime. Mirrors the historical
+# `agent-runtime` definition so default/local integration builds still
+# pull every chat channel + matrix-sdk + lettre + IMAP + ratatui + the
+# OAuth/TLS extras. Keep in lock-step with upstream's old `agent-runtime`
+# list when rebasing — this is the only place we re-add those deps in
+# the fork.
+agent-runtime-full = [
+    "agent-runtime",
     "dep:ratatui", "dep:crossterm",
-    "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
-    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:tokio-socks", "dep:hostname",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
@@ -301,6 +328,10 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+# Brick fork — local WS bridge for the Brick OS Node.js process. Forwards
+# to both the channels crate (BrickChannel impl) and the config crate
+# (BrickConfig schema cfg-gate).
+channel-brick = ["zeroclaw-channels/channel-brick", "zeroclaw-config/channel-brick"]
 channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]

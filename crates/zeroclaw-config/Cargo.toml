@@ -51,3 +51,6 @@ default = ["schema-export"]
 schema-export = ["dep:schemars"]
 channel-nostr = []
 voice-wake = []
+# Brick fork — enables BrickConfig in `schema.rs`. Mirrors `channel-nostr`
+# (cfg gate only, no extra deps).
+channel-brick = []

@@ -9,6 +9,13 @@ pub mod link_enricher;
 pub mod transcription;
 pub mod tts;
 
+// Brick fork — local WS bridge for the Brick OS Node.js process. Cfg-gated
+// behind `channel-brick`; see vendor/PATCHES.md for the full divergence
+// registry. Pattern mirrors `channel-nostr` (cfg-gated end-to-end), NOT
+// `channel-webhook` (which is unconditional).
+#[cfg(feature = "channel-brick")]
+pub mod brick;
+
 // Feature-gated channels
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
