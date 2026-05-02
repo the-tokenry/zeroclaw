@@ -423,6 +423,11 @@ path = "tests/test_system.rs"
 name = "live"
 path = "tests/test_live.rs"
 
+# Brick fork canary tests — see vendor/PATCHES.md.
+[[test]]
+name = "brick_factory_dispatch"
+path = "tests/brick_factory_dispatch.rs"
+
 [[bench]]
 name = "agent_benchmarks"
 harness = false

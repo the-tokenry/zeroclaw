@@ -74,8 +74,6 @@ pub use crate::telegram::TelegramChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
-pub use zeroclaw_infra::session_backend::SessionBackend;
-pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
@@ -4448,6 +4446,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(BrickChannel::new(
                 bc.socket_path.clone(),
                 bc.max_connections,
+                config.workspace_dir.clone(),
             )))
         }
         other => anyhow::bail!(
@@ -5182,6 +5181,12 @@ fn collect_configured_channels(
     // Brick fork: local WS bridge for the Brick OS Node.js process. Mirrors
     // the unconditional webhook block above, but cfg-gated end-to-end so a
     // build without `--features channel-brick` doesn't pull the trait impl.
+    //
+    // workspace_dir is passed so BrickChannel can read the JSONL session
+    // store the orchestrator already writes to (via append_sender_turn) when
+    // apps/os issues a `history_request` frame. Channel persistence stays
+    // JSONL — the [channels].session_backend = "sqlite" knob applies only
+    // to the gateway in v0.7.4, not to channel sessions.
     #[cfg(feature = "channel-brick")]
     if let Some(ref bc) = config.channels.brick {
         if bc.enabled {
@@ -5190,6 +5195,7 @@ fn collect_configured_channels(
                 channel: Arc::new(BrickChannel::new(
                     bc.socket_path.clone(),
                     bc.max_connections,
+                    config.workspace_dir.clone(),
                 )),
             });
         } else {

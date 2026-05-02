@@ -24,12 +24,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_infra::session_store::SessionStore;
 
 /// Inbound (apps/os → brick.rs) frame discriminated union.
 ///
@@ -238,58 +238,43 @@ impl Router {
     }
 }
 
-/// Per-(channel, scope) cancellation tokens so a `cancel` frame can stop
-/// the in-flight turn for the same `(reply_target, sender_id, thread_ts)`
-/// scope without hand-rolling another cancellation pump. The orchestrator
-/// pulls these out of `cancellation_token_for` when it builds the
-/// per-turn `SendMessage`.
-#[derive(Default)]
-struct CancellationRegistry {
-    tokens: HashMap<String, CancellationToken>,
-}
-
-impl CancellationRegistry {
-    fn key(channel: &str, sender_id: &str, reply_target: &str, thread_ts: Option<&str>) -> String {
-        match thread_ts {
-            Some(ts) => format!("{channel}/{reply_target}/{ts}/{sender_id}"),
-            None => format!("{channel}/{reply_target}/{sender_id}"),
-        }
-    }
-
-    fn upsert(&mut self, key: String) -> CancellationToken {
-        self.tokens
-            .entry(key)
-            .or_insert_with(CancellationToken::new)
-            .clone()
-    }
-
-    fn cancel(&mut self, key: &str) {
-        if let Some(tok) = self.tokens.remove(key) {
-            tok.cancel();
-        }
-    }
-}
-
 /// BrickChannel is the device-local WS bridge. Keep this fork-only — the
 /// upstream `Channel` trait is the only seam, so a future rebase only
-/// touches the cargo features + the 8 wiring sites in §3.2 of the plan.
+/// touches the cargo features + the 7 wiring sites in §3.2 of the plan.
+///
+/// Cancellation is delegated to the orchestrator's existing `/stop` fast
+/// path: a `cancel` frame is translated to a synthetic `ChannelMessage`
+/// with `content = "/stop"` and pushed onto the same `mpsc::Sender` we
+/// receive in `listen()`. The orchestrator picks it up at
+/// `is_stop_command(&msg.content)` and cancels the in-flight task for
+/// that `(channel, reply_target, sender)` scope. We do not maintain a
+/// parallel cancellation registry — that path was never threaded into
+/// `SendMessage::with_cancellation()` upstream.
+///
+/// `workspace_dir` is the daemon's `Config.workspace_dir`, passed at
+/// construction so `history_request` can read the JSONL `SessionStore`
+/// the orchestrator already writes to via `append_sender_turn`.
 pub struct BrickChannel {
     socket_path: PathBuf,
+    workspace_dir: PathBuf,
     max_connections: u32,
     daemon_version: String,
     router: Arc<Mutex<Router>>,
-    cancels: Arc<Mutex<CancellationRegistry>>,
     listening: Arc<Mutex<bool>>,
 }
 
 impl BrickChannel {
-    pub fn new(socket_path: impl Into<PathBuf>, max_connections: u32) -> Self {
+    pub fn new(
+        socket_path: impl Into<PathBuf>,
+        max_connections: u32,
+        workspace_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             socket_path: socket_path.into(),
+            workspace_dir: workspace_dir.into(),
             max_connections,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             router: Arc::new(Mutex::new(Router::default())),
-            cancels: Arc::new(Mutex::new(CancellationRegistry::default())),
             listening: Arc::new(Mutex::new(false)),
         }
     }
@@ -372,13 +357,19 @@ impl Channel for BrickChannel {
                 }
             };
             let router = self.router.clone();
-            let cancels = self.cancels.clone();
             let inbound_tx = tx.clone();
             let daemon_version = self.daemon_version.clone();
+            let workspace_dir = self.workspace_dir.clone();
 
             tokio::spawn(async move {
-                if let Err(err) =
-                    handle_connection(stream, router, cancels, inbound_tx, daemon_version).await
+                if let Err(err) = handle_connection(
+                    stream,
+                    router,
+                    inbound_tx,
+                    daemon_version,
+                    workspace_dir,
+                )
+                .await
                 {
                     debug!("brick: connection ended: {err:?}");
                 }
@@ -553,9 +544,9 @@ fn derive_draft_id(recipient: &str, thread: Option<&str>) -> String {
 async fn handle_connection(
     stream: UnixStream,
     router: Arc<Mutex<Router>>,
-    cancels: Arc<Mutex<CancellationRegistry>>,
     inbound_tx: mpsc::Sender<ChannelMessage>,
     daemon_version: String,
+    workspace_dir: PathBuf,
 ) -> Result<()> {
     let ws: WebSocketStream<UnixStream> = tokio_tungstenite::accept_async(stream)
         .await
@@ -585,8 +576,15 @@ async fn handle_connection(
     });
 
     // Inbound loop.
-    let result = read_loop(&mut reader, &router, conn_id, &cancels, &inbound_tx, &daemon_version)
-        .await;
+    let result = read_loop(
+        &mut reader,
+        &router,
+        conn_id,
+        &inbound_tx,
+        &daemon_version,
+        &workspace_dir,
+    )
+    .await;
 
     // Drop the outbound channel + connection registration.
     drop(out_tx);
@@ -603,9 +601,9 @@ async fn read_loop(
     reader: &mut futures_util::stream::SplitStream<WebSocketStream<UnixStream>>,
     router: &Arc<Mutex<Router>>,
     conn_id: ConnId,
-    cancels: &Arc<Mutex<CancellationRegistry>>,
     inbound_tx: &mpsc::Sender<ChannelMessage>,
     daemon_version: &str,
+    workspace_dir: &PathBuf,
 ) -> Result<()> {
     while let Some(item) = reader.next().await {
         let msg = match item {
@@ -662,18 +660,6 @@ async fn read_loop(
                     let mut r = router.lock().await;
                     r.associate(conn_id, sender_id.clone());
                 }
-                // Pre-arm a cancellation token for this scope so a later
-                // `cancel` frame can interrupt the in-flight turn.
-                {
-                    let mut reg = cancels.lock().await;
-                    let key = CancellationRegistry::key(
-                        "brick",
-                        &sender_id,
-                        &reply_target,
-                        thread_ts.as_deref(),
-                    );
-                    reg.upsert(key);
-                }
                 let cm = ChannelMessage {
                     id: message_id,
                     sender: sender_id,
@@ -693,16 +679,28 @@ async fn read_loop(
                 sender_id,
                 reply_target,
                 thread_ts,
-                message_id: _,
+                message_id,
             } => {
-                let mut reg = cancels.lock().await;
-                let key = CancellationRegistry::key(
-                    "brick",
-                    &sender_id,
-                    &reply_target,
-                    thread_ts.as_deref(),
-                );
-                reg.cancel(&key);
+                // Inject a synthetic `/stop` ChannelMessage with the same
+                // (channel, reply_target, sender) scope as the in-flight
+                // turn. The orchestrator's existing `is_stop_command` fast
+                // path picks this up and cancels the running task via its
+                // already-built `with_cancellation()` plumbing — no
+                // parallel cancellation registry needed.
+                let cm = ChannelMessage {
+                    id: message_id,
+                    sender: sender_id,
+                    reply_target,
+                    content: "/stop".to_string(),
+                    channel: "brick".to_string(),
+                    timestamp: now_secs(),
+                    thread_ts,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+                if inbound_tx.send(cm).await.is_err() {
+                    break;
+                }
             }
             InboundFrame::ModelSet {
                 sender_id,
@@ -750,22 +748,49 @@ async fn read_loop(
                 sender_id,
                 reply_target,
                 thread_ts,
-                limit: _,
+                limit,
                 before_ts: _,
             } => {
-                // The orchestrator owns the `SessionBackend`; until the
-                // wiring site (§3.2 site 8) plumbs that handle to brick.rs,
-                // respond with an empty list so apps/os doesn't hang. The
-                // future patch will replace this with a real lookup keyed
-                // by `conversation_history_key()`.
+                // Read from the JSONL `SessionStore` the orchestrator
+                // already writes to via `append_sender_turn`. Key shape
+                // mirrors `conversation_history_key()` exactly so the
+                // brick channel never disagrees with what the agent
+                // hydrates on startup.
+                let key = match thread_ts.as_deref() {
+                    Some(tid) => format!("brick_{reply_target}_{tid}_{sender_id}"),
+                    None => format!("brick_{reply_target}_{sender_id}"),
+                };
+                let mut messages: Vec<HistoryMessage> = match SessionStore::new(workspace_dir) {
+                    Ok(store) => store
+                        .load(&key)
+                        .into_iter()
+                        .map(|m| HistoryMessage {
+                            role: m.role,
+                            content: m.content,
+                            // SessionStore JSONL doesn't preserve
+                            // per-message timestamps; surface 0 so apps/os
+                            // can sort by index instead.
+                            ts: 0,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        warn!("brick: SessionStore open failed: {e}");
+                        Vec::new()
+                    }
+                };
+                if let Some(n) = limit {
+                    if messages.len() > n {
+                        let drop_count = messages.len() - n;
+                        messages.drain(..drop_count);
+                    }
+                }
                 let r = router.lock().await;
                 if let Some(entry) = r.connections.get(&conn_id) {
                     let _ = entry.tx.try_send(OutboundFrame::HistoryResponse {
                         sender_id,
                         reply_target,
-                        messages: vec![],
+                        messages,
                     });
-                    let _ = thread_ts;
                 }
             }
             InboundFrame::Ping => {
@@ -796,13 +821,13 @@ mod tests {
 
     #[test]
     fn brick_channel_name() {
-        let bc = BrickChannel::new("/tmp/brick-test.sock", 4);
+        let bc = BrickChannel::new("/tmp/brick-test.sock", 4, "/tmp");
         assert_eq!(bc.name(), "brick");
     }
 
     #[tokio::test]
     async fn health_check_false_before_listen() {
-        let bc = BrickChannel::new("/tmp/brick-not-bound.sock", 4);
+        let bc = BrickChannel::new("/tmp/brick-not-bound.sock", 4, "/tmp");
         assert!(!bc.health_check().await);
     }
 
@@ -810,7 +835,7 @@ mod tests {
     async fn listen_binds_socket_with_correct_perms() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("zeroclaw.sock");
-        let bc = Arc::new(BrickChannel::new(&sock, 2));
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
         let bc_clone = bc.clone();
         let (tx, _rx) = mpsc::channel(1);
 
@@ -840,7 +865,7 @@ mod tests {
     async fn ping_pong_round_trip() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("zeroclaw.sock");
-        let bc = Arc::new(BrickChannel::new(&sock, 2));
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
         let bc_clone = bc.clone();
         let (tx, _rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
@@ -893,7 +918,7 @@ mod tests {
     async fn malformed_json_closes_connection() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("zeroclaw.sock");
-        let bc = Arc::new(BrickChannel::new(&sock, 2));
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
         let bc_clone = bc.clone();
         let (tx, _rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
@@ -954,5 +979,257 @@ mod tests {
         let json = serde_json::to_string(&draft).unwrap();
         assert!(json.contains("\"type\":\"draft_delta\""), "got {json}");
         assert!(json.contains("\"draft_id\":\"d1\""), "got {json}");
+    }
+
+    #[test]
+    fn draft_lifecycle_frames_round_trip() {
+        // Lock in the on-wire shape for the full draft lifecycle so apps/os
+        // can rely on field names not silently changing across rebases.
+        let start = OutboundFrame::DraftStart {
+            sender_id: "u:d".into(),
+            draft_id: "draft-1".into(),
+            conversation_id: "u:d".into(),
+        };
+        let s = serde_json::to_string(&start).unwrap();
+        assert!(s.contains("\"type\":\"draft_start\""));
+        assert!(s.contains("\"sender_id\":\"u:d\""));
+        assert!(s.contains("\"draft_id\":\"draft-1\""));
+
+        let final_ = OutboundFrame::DraftFinalize {
+            draft_id: "draft-1".into(),
+            text: "done".into(),
+        };
+        let s = serde_json::to_string(&final_).unwrap();
+        assert!(s.contains("\"type\":\"draft_finalize\""));
+        assert!(s.contains("\"text\":\"done\""));
+
+        let cancel = OutboundFrame::DraftCancel {
+            draft_id: "draft-1".into(),
+        };
+        let s = serde_json::to_string(&cancel).unwrap();
+        assert!(s.contains("\"type\":\"draft_cancel\""));
+        assert!(s.contains("\"draft_id\":\"draft-1\""));
+
+        let progress = OutboundFrame::ToolProgress {
+            draft_id: "draft-1".into(),
+            text: "running tool".into(),
+        };
+        let s = serde_json::to_string(&progress).unwrap();
+        assert!(s.contains("\"type\":\"tool_progress\""));
+
+        let history = OutboundFrame::HistoryResponse {
+            sender_id: "u:d".into(),
+            reply_target: "conv1".into(),
+            messages: vec![HistoryMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                ts: 0,
+            }],
+        };
+        let s = serde_json::to_string(&history).unwrap();
+        assert!(s.contains("\"type\":\"history_response\""));
+        assert!(s.contains("\"reply_target\":\"conv1\""));
+        assert!(s.contains("\"role\":\"user\""));
+    }
+
+    #[tokio::test]
+    async fn cancel_frame_injects_synthetic_stop_message() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, _wrx) = ws.split();
+
+        let cancel_payload = serde_json::json!({
+            "type": "cancel",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-42",
+            "thread_ts": null,
+            "message_id": "msg-cancel-1"
+        });
+        wsx.send(WsMessage::Text(cancel_payload.to_string().into()))
+            .await
+            .unwrap();
+
+        let cm = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("rx timed out")
+            .expect("rx closed");
+
+        assert_eq!(cm.channel, "brick");
+        assert_eq!(cm.content, "/stop");
+        assert_eq!(cm.sender, "user1:dev1");
+        assert_eq!(cm.reply_target, "conv-42");
+        assert!(cm.thread_ts.is_none());
+        assert_eq!(cm.id, "msg-cancel-1");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn history_request_returns_persisted_jsonl_messages() {
+        use zeroclaw_api::provider::ChatMessage;
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+
+        // Seed the JSONL session store under the brick channel's
+        // conversation_history_key shape: brick_<reply_target>_<sender>.
+        {
+            let store = SessionStore::new(dir.path()).expect("session store");
+            let key = "brick_conv-42_user1:dev1";
+            store.append(key, &ChatMessage::user("hello")).unwrap();
+            store
+                .append(key, &ChatMessage::assistant("hi back"))
+                .unwrap();
+        }
+
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, mut wrx) = ws.split();
+
+        let payload = serde_json::json!({
+            "type": "history_request",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-42",
+            "thread_ts": null,
+            "limit": null,
+            "before_ts": null,
+        });
+        wsx.send(WsMessage::Text(payload.to_string().into()))
+            .await
+            .unwrap();
+
+        let response_text = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("history response timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"history_response\"") {
+                    break t;
+                }
+            }
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_text).expect("response is JSON");
+        assert_eq!(parsed["sender_id"], "user1:dev1");
+        assert_eq!(parsed["reply_target"], "conv-42");
+        let messages = parsed["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2, "expected two persisted turns");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "hi back");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn history_request_respects_limit() {
+        use zeroclaw_api::provider::ChatMessage;
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+
+        {
+            let store = SessionStore::new(dir.path()).expect("session store");
+            let key = "brick_room1_alice:dev1";
+            for i in 0..5 {
+                store.append(key, &ChatMessage::user(format!("m{i}"))).unwrap();
+            }
+        }
+
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, mut wrx) = ws.split();
+
+        let payload = serde_json::json!({
+            "type": "history_request",
+            "sender_id": "alice:dev1",
+            "reply_target": "room1",
+            "thread_ts": null,
+            "limit": 2,
+            "before_ts": null,
+        });
+        wsx.send(WsMessage::Text(payload.to_string().into()))
+            .await
+            .unwrap();
+
+        let response_text = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("history response timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"history_response\"") {
+                    break t;
+                }
+            }
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_text).expect("response is JSON");
+        let messages = parsed["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2, "limit=2 should drop oldest 3 of 5");
+        // Limit keeps the most recent — m3 and m4.
+        assert_eq!(messages[0]["content"], "m3");
+        assert_eq!(messages[1]["content"], "m4");
+
+        handle.abort();
     }
 }
