@@ -30,7 +30,7 @@ fn fallback_anthropic_custom_url_dispatches_to_anthropic_provider() {
     // factory_configure_zeroclaw TOML stops constructing AnthropicProvider
     // and the device's first chat turn errors with "Unknown provider".
     let p = create_provider(
-        "anthropic-custom:https://cloud.brick.app/v1/llm/anthropic",
+        "anthropic-custom:https://api.brick.thetokenry.com/v1/llm/anthropic",
         Some("eyJhbGciOiJIUzI1NiJ9.test.sig"),
     );
     if let Err(e) = p {
@@ -43,7 +43,7 @@ fn fallback_custom_url_dispatches_to_openai_compatible_provider() {
     // Same canary for the `custom:URL` arm — used by the OpenAI-native and
     // LiteLLM-passthrough profiles.
     let p = create_provider(
-        "custom:https://cloud.brick.app/v1/llm/openai/v1",
+        "custom:https://api.brick.thetokenry.com/v1/llm/openai/v1",
         Some("eyJhbGciOiJIUzI1NiJ9.test.sig"),
     );
     if let Err(e) = p {
@@ -51,7 +51,7 @@ fn fallback_custom_url_dispatches_to_openai_compatible_provider() {
     }
 
     let p2 = create_provider(
-        "custom:https://cloud.brick.app/v1/llm",
+        "custom:https://api.brick.thetokenry.com/v1/llm",
         Some("eyJhbGciOiJIUzI1NiJ9.test.sig"),
     );
     if let Err(e) = p2 {
