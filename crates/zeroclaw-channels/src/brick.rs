@@ -90,6 +90,15 @@ pub enum InboundFrame {
         thread_ts: Option<String>,
         limit: Option<usize>,
     },
+    /// Read the model hint last set for this session via `model_set`.
+    /// Brick-side counterpart to `ModelSet`; the daemon answers with
+    /// `OutboundFrame::ModelGetOk` carrying the cached hint or `null`
+    /// when the session is on the fleet default.
+    ModelGet {
+        sender_id: String,
+        reply_target: String,
+        thread_ts: Option<String>,
+    },
     Ping,
 }
 
@@ -178,6 +187,18 @@ pub enum OutboundFrame {
         sender_id: String,
         reply_target: String,
         model: String,
+    },
+    /// Reply to `InboundFrame::ModelGet`. `model` is `Some(hint)` when
+    /// the session has been switched off the fleet default via a prior
+    /// `ModelSet`; `None` when the session is still on the daemon's
+    /// configured default. `thread_ts` echoes the request so concurrent
+    /// `model_get` calls across different threads can be matched back
+    /// to their waiters precisely.
+    ModelGetOk {
+        sender_id: String,
+        reply_target: String,
+        thread_ts: Option<String>,
+        model: Option<String>,
     },
     Pong,
 }
@@ -302,6 +323,28 @@ pub struct BrickChannel {
     /// the matching `ApprovalResponse` here; the read_loop resolves it
     /// when the brick-os client sends one back.
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    /// Per-session model hints last set via `ModelSet`. Keyed by
+    /// `session_key(sender_id, reply_target, thread_ts)`. The
+    /// orchestrator's `route_overrides` is the source of truth for
+    /// inference; this map is the read API for `ModelGet` so the mobile
+    /// picker can display what the user picked. Updated synchronously
+    /// when a `ModelSet` arrives (so a `ModelGet` immediately after
+    /// `ModelSetOk` returns the new value, even before the orchestrator
+    /// drains the synthetic `/model` command). Lost on daemon restart —
+    /// same lifecycle as `route_overrides`.
+    session_models: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Composite key that scopes a model hint to one (sender, reply_target,
+/// thread) tuple. Mirrors the (channel, reply_target, sender, thread_ts)
+/// shape that `conversation_history_key` uses for the orchestrator's
+/// `route_overrides`, but joined with `|` so callers can construct it
+/// without knowing the orchestrator's exact format.
+fn session_key(sender_id: &str, reply_target: &str, thread_ts: Option<&str>) -> String {
+    match thread_ts {
+        Some(t) => format!("{sender_id}|{reply_target}|{t}"),
+        None => format!("{sender_id}|{reply_target}|"),
+    }
 }
 
 impl BrickChannel {
@@ -319,6 +362,7 @@ impl BrickChannel {
             router: Arc::new(Mutex::new(Router::default())),
             listening: Arc::new(Mutex::new(false)),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            session_models: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -437,6 +481,7 @@ impl Channel for BrickChannel {
             let workspace_dir = self.workspace_dir.clone();
             let auth_token = self.auth_token.clone();
             let pending_approvals = self.pending_approvals.clone();
+            let session_models = self.session_models.clone();
 
             tokio::spawn(async move {
                 if let Err(err) = handle_connection(
@@ -447,6 +492,7 @@ impl Channel for BrickChannel {
                     workspace_dir,
                     auth_token,
                     pending_approvals,
+                    session_models,
                 )
                 .await
                 {
@@ -692,6 +738,7 @@ async fn handle_connection(
     workspace_dir: PathBuf,
     auth_token: Option<Arc<String>>,
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    session_models: Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<()> {
     let ws: WebSocketStream<UnixStream> = tokio_tungstenite::accept_async(stream)
         .await
@@ -744,6 +791,7 @@ async fn handle_connection(
         &workspace_dir,
         auth_token.as_deref().map(String::as_str),
         &pending_approvals,
+        &session_models,
     )
     .await;
 
@@ -767,6 +815,7 @@ async fn read_loop(
     workspace_dir: &PathBuf,
     auth_token: Option<&str>,
     pending_approvals: &Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    session_models: &Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<()> {
     // J7: when auth is enabled, every frame other than Hello / HelloAuth /
     // Ping is rejected until the client sends matching `HelloAuth { token }`.
@@ -912,6 +961,16 @@ async fn read_loop(
                     let mut r = router.lock().await;
                     r.associate(conn_id, sender_id.clone());
                 }
+                // Update the brick.rs read cache before dispatching the
+                // synthetic /model so a `ModelGet` issued immediately
+                // after `ModelSetOk` reflects the user's pick — even if
+                // the orchestrator hasn't drained the inbound channel
+                // yet.
+                {
+                    let key = session_key(&sender_id, &reply_target, thread_ts.as_deref());
+                    let mut models = session_models.lock().await;
+                    models.insert(key, model.clone());
+                }
                 let cm = ChannelMessage {
                     id: format!("brick-model-{}", Uuid::new_v4()),
                     sender: sender_id.clone(),
@@ -931,6 +990,23 @@ async fn read_loop(
                     let _ = entry.tx.try_send(OutboundFrame::ModelSetOk {
                         sender_id,
                         reply_target,
+                        model,
+                    });
+                }
+            }
+            InboundFrame::ModelGet {
+                sender_id,
+                reply_target,
+                thread_ts,
+            } => {
+                let key = session_key(&sender_id, &reply_target, thread_ts.as_deref());
+                let model = session_models.lock().await.get(&key).cloned();
+                let r = router.lock().await;
+                if let Some(entry) = r.connections.get(&conn_id) {
+                    let _ = entry.tx.try_send(OutboundFrame::ModelGetOk {
+                        sender_id,
+                        reply_target,
+                        thread_ts,
                         model,
                     });
                 }
@@ -1756,6 +1832,167 @@ mod tests {
         // Limit keeps the most recent — m3 and m4.
         assert_eq!(messages[0]["content"], "m3");
         assert_eq!(messages[1]["content"], "m4");
+
+        handle.abort();
+    }
+
+    #[test]
+    fn session_key_isolates_by_sender_target_and_thread() {
+        // Different (sender, target, thread) tuples must produce
+        // distinct keys so a model set in one session can't bleed into
+        // another. Two sessions that differ only by thread_ts (None vs.
+        // Some(""), Some("a") vs. Some("b")) are also distinct.
+        let a = session_key("u1:d1", "conv-A", None);
+        let b = session_key("u1:d1", "conv-B", None);
+        let c = session_key("u2:d1", "conv-A", None);
+        let d = session_key("u1:d1", "conv-A", Some("t1"));
+        let e = session_key("u1:d1", "conv-A", Some("t2"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+        assert_ne!(d, e);
+    }
+
+    #[tokio::test]
+    async fn model_get_returns_none_until_model_set_then_returns_hint() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        // Drain inbound — the synthetic `/model` ChannelMessage flows
+        // here. Test only cares about outbound frames over the WS.
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, mut wrx) = ws.split();
+
+        // 1. ModelGet on a fresh session returns model: null.
+        let get1 = serde_json::json!({
+            "type": "model_get",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-1",
+            "thread_ts": null,
+        });
+        wsx.send(WsMessage::Text(get1.to_string().into()))
+            .await
+            .unwrap();
+        let resp1 = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("model_get_ok #1 timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"model_get_ok\"") {
+                    break t;
+                }
+            }
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&resp1).unwrap();
+        assert_eq!(parsed["sender_id"], "user1:dev1");
+        assert_eq!(parsed["reply_target"], "conv-1");
+        assert!(
+            parsed["model"].is_null(),
+            "fresh session must return null, got {parsed}"
+        );
+
+        // 2. ModelSet writes the cache and emits ModelSetOk.
+        let set = serde_json::json!({
+            "type": "model_set",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-1",
+            "thread_ts": null,
+            "model": "hint:sonnet",
+        });
+        wsx.send(WsMessage::Text(set.to_string().into()))
+            .await
+            .unwrap();
+        // Drain the synthetic /model ChannelMessage so the inbound
+        // channel doesn't fill up.
+        let _ = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("synthetic /model timeout");
+        // Drain ModelSetOk.
+        let _set_ok = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("model_set_ok timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"model_set_ok\"") {
+                    break t;
+                }
+            }
+        };
+
+        // 3. ModelGet on the same session returns the just-set hint.
+        let get2 = serde_json::json!({
+            "type": "model_get",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-1",
+            "thread_ts": null,
+        });
+        wsx.send(WsMessage::Text(get2.to_string().into()))
+            .await
+            .unwrap();
+        let resp2 = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("model_get_ok #2 timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"model_get_ok\"") {
+                    break t;
+                }
+            }
+        };
+        let parsed2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(parsed2["model"], "hint:sonnet");
+
+        // 4. ModelGet for a different (sender, target) returns null —
+        //    sessions don't bleed across the cache key.
+        let get3 = serde_json::json!({
+            "type": "model_get",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-OTHER",
+            "thread_ts": null,
+        });
+        wsx.send(WsMessage::Text(get3.to_string().into()))
+            .await
+            .unwrap();
+        let resp3 = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("model_get_ok #3 timeout")
+                .expect("ws closed")
+                .expect("ws error");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"model_get_ok\"") {
+                    break t;
+                }
+            }
+        };
+        let parsed3: serde_json::Value = serde_json::from_str(&resp3).unwrap();
+        assert!(
+            parsed3["model"].is_null(),
+            "isolated session must stay null, got {parsed3}"
+        );
 
         handle.abort();
     }
