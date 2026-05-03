@@ -179,6 +179,34 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Brick fork plan 3 / C3: structured tool-call start. Default
+    /// is no-op so non-brick channels keep emitting human-readable
+    /// progress text via `update_draft_progress`. Channels with a rich
+    /// UI (BrickChannel) emit a typed wire frame instead.
+    async fn tool_call_start(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _tool_id: Option<&str>,
+        _tool_name: &str,
+        _arguments_json: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Brick fork plan 3 / C3: structured tool-call result.
+    async fn tool_call_result(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _tool_id: Option<&str>,
+        _tool_name: &str,
+        _success: bool,
+        _output: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     async fn finalize_draft(
         &self,

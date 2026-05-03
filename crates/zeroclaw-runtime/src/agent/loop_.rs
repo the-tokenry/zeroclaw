@@ -302,6 +302,23 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// C3 (brick plan 3): structured tool-call start. Carries the
+    /// tool's name + arguments + a stable id so channels with rich UIs
+    /// (e.g. brick mobile app's `ToolCallCard`) can render before the
+    /// result arrives. Channels without a rich UI ignore these by
+    /// default — the trait method is a no-op.
+    ToolStart {
+        tool_id: Option<String>,
+        tool_name: String,
+        arguments_json: String,
+    },
+    /// C3: structured tool-call result.
+    ToolResult {
+        tool_id: Option<String>,
+        tool_name: String,
+        success: bool,
+        output: String,
+    },
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -1745,6 +1762,16 @@ pub async fn run_tool_call_loop(
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(StreamDelta::Status(progress)).await;
+                // C3: structured event for rich-UI channels.
+                let arguments_json = serde_json::to_string(&tool_args)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let _ = tx
+                    .send(StreamDelta::ToolStart {
+                        tool_id: call.tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments_json: scrub_credentials(&arguments_json),
+                    })
+                    .await;
             }
 
             executable_indices.push(idx);
@@ -1826,6 +1853,19 @@ pub async fn run_tool_call_loop(
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(StreamDelta::Status(progress_msg)).await;
+                // C3: structured tool result. Output is truncated to keep
+                // the WS frame economical — rich-UI channels show a
+                // condensed body anyway, and full output is recoverable
+                // from the assistant message persisted in session history.
+                let truncated_output = scrub_credentials(&truncate_with_ellipsis(&outcome.output, 4096));
+                let _ = tx
+                    .send(StreamDelta::ToolResult {
+                        tool_id: call.tool_call_id.clone(),
+                        tool_name: call.name.clone(),
+                        success: outcome.success,
+                        output: truncated_output,
+                    })
+                    .await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -2876,6 +2916,11 @@ pub async fn run(
                             print!("{text}");
                             let _ = std::io::stdout().flush();
                         }
+                        // C3: CLI consumer ignores structured tool events
+                        // — the human-readable Status text already
+                        // surfaces the same info via the existing
+                        // emoji/duration line.
+                        StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => {}
                     }
                 }
             });
@@ -5881,6 +5926,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => {}
             }
         }
 
@@ -5952,6 +5998,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => {}
             }
         }
 
@@ -6030,6 +6077,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => {}
             }
         }
 
@@ -6117,6 +6165,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => {}
             }
         }
 
@@ -7219,6 +7268,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolResult { .. } => "",
             })
             .collect();
 

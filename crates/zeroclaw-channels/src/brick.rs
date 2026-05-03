@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
@@ -30,6 +32,13 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_infra::session_store::SessionStore;
+
+/// D1/D2 (plan 3): how long the daemon waits for an `ApprovalResponse`
+/// frame before defaulting to Deny. The mobile app's modal sheet has
+/// ~25s of attention budget in practice; 30s gives a small grace. The
+/// vendor `request_approval` is invoked synchronously from the agent
+/// loop, so this also caps how long a single tool-call sit blocks.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inbound (apps/os → brick.rs) frame discriminated union.
 ///
@@ -41,6 +50,15 @@ pub enum InboundFrame {
     Hello {
         client: String,
         version: Option<String>,
+    },
+    /// Defense-in-depth: when the daemon was constructed with an auth
+    /// token, every connection must send `HelloAuth { token }` before
+    /// any frame other than `Hello` / `Ping` is honored. Filesystem
+    /// perms (mode 0660 + brick:brick) remain the primary gate; this
+    /// handshake is the secondary line if perms are misconfigured. See
+    /// J7 in plan 3.
+    HelloAuth {
+        token: String,
     },
     Message {
         sender_id: String,
@@ -71,7 +89,6 @@ pub enum InboundFrame {
         reply_target: String,
         thread_ts: Option<String>,
         limit: Option<usize>,
-        before_ts: Option<u64>,
     },
     Ping,
 }
@@ -110,13 +127,28 @@ pub enum OutboundFrame {
         draft_id: String,
         text: String,
     },
-    ThinkingDelta {
-        draft_id: String,
-        text: String,
-    },
     ToolProgress {
         draft_id: String,
         text: String,
+    },
+    /// C3 (plan 3): structured tool-call start. Carries the tool's
+    /// name + arg summary so the brick mobile app can render a
+    /// `ToolCallCard` instead of falling back to a thinking blob.
+    ToolCallStart {
+        draft_id: String,
+        tool_id: Option<String>,
+        tool_name: String,
+        arguments_json: String,
+    },
+    /// C3: structured tool-call result. Truncated upstream to ~4 KB
+    /// for wire economy; the full output is recoverable from the
+    /// assistant message persisted in session history.
+    ToolCallResult {
+        draft_id: String,
+        tool_id: Option<String>,
+        tool_name: String,
+        success: bool,
+        output: String,
     },
     DraftFinalize {
         draft_id: String,
@@ -259,8 +291,17 @@ pub struct BrickChannel {
     workspace_dir: PathBuf,
     max_connections: u32,
     daemon_version: String,
+    /// J7: if `Some`, the daemon enforces a `HelloAuth { token }`
+    /// handshake on every connection. `None` skips enforcement (legacy
+    /// behavior — relies on filesystem perms only).
+    auth_token: Option<Arc<String>>,
     router: Arc<Mutex<Router>>,
     listening: Arc<Mutex<bool>>,
+    /// D1/D2: pending approval requests. Key is the `request_id` we
+    /// emit in `OutboundFrame::ApprovalRequest`. The agent loop awaits
+    /// the matching `ApprovalResponse` here; the read_loop resolves it
+    /// when the brick-os client sends one back.
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
 }
 
 impl BrickChannel {
@@ -274,9 +315,22 @@ impl BrickChannel {
             workspace_dir: workspace_dir.into(),
             max_connections,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            auth_token: None,
             router: Arc::new(Mutex::new(Router::default())),
             listening: Arc::new(Mutex::new(false)),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enable J7 in-protocol auth. The daemon writes the token to a
+    /// per-boot file at `<workspace_dir>/brick-channel.token` (mode
+    /// 0600, owner-only) when `listen()` runs, and rejects frames other
+    /// than Hello / HelloAuth / Ping until the client supplies it.
+    /// Brick-os reads the file and sends the matching `HelloAuth`
+    /// frame after its initial `Hello`.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(Arc::new(token.into()));
+        self
     }
 
     async fn dispatch(&self, frame: OutboundFrame, recipient: &str) {
@@ -329,6 +383,27 @@ impl Channel for BrickChannel {
             .with_context(|| format!("bind {}", self.socket_path.display()))?;
         set_socket_perms(&self.socket_path)?;
 
+        // J7: persist the auth token so brick-os can read it. Mode 0600
+        // because only the daemon owner needs to read it (brick-os runs
+        // as the same user). No-op when auth_token is None.
+        if let Some(token) = self.auth_token.as_ref() {
+            let token_path = self.workspace_dir.join("brick-channel.token");
+            if let Some(parent) = token_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("mkdir -p {}", parent.display()))?;
+            }
+            std::fs::write(&token_path, token.as_bytes())
+                .with_context(|| format!("write token {}", token_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::fs::Permissions;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&token_path, Permissions::from_mode(0o600))
+                    .with_context(|| format!("chmod 0600 {}", token_path.display()))?;
+            }
+            info!(token_path = ?token_path, "BrickChannel auth token written");
+        }
+
         {
             let mut listening = self.listening.lock().await;
             *listening = true;
@@ -360,6 +435,8 @@ impl Channel for BrickChannel {
             let inbound_tx = tx.clone();
             let daemon_version = self.daemon_version.clone();
             let workspace_dir = self.workspace_dir.clone();
+            let auth_token = self.auth_token.clone();
+            let pending_approvals = self.pending_approvals.clone();
 
             tokio::spawn(async move {
                 if let Err(err) = handle_connection(
@@ -368,6 +445,8 @@ impl Channel for BrickChannel {
                     inbound_tx,
                     daemon_version,
                     workspace_dir,
+                    auth_token,
+                    pending_approvals,
                 )
                 .await
                 {
@@ -452,6 +531,50 @@ impl Channel for BrickChannel {
         Ok(())
     }
 
+    async fn tool_call_start(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        tool_id: Option<&str>,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<()> {
+        self.dispatch(
+            OutboundFrame::ToolCallStart {
+                draft_id: message_id.to_string(),
+                tool_id: tool_id.map(str::to_string),
+                tool_name: tool_name.to_string(),
+                arguments_json: arguments_json.to_string(),
+            },
+            recipient,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn tool_call_result(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        tool_id: Option<&str>,
+        tool_name: &str,
+        success: bool,
+        output: &str,
+    ) -> Result<()> {
+        self.dispatch(
+            OutboundFrame::ToolCallResult {
+                draft_id: message_id.to_string(),
+                tool_id: tool_id.map(str::to_string),
+                tool_name: tool_name.to_string(),
+                success,
+                output: output.to_string(),
+            },
+            recipient,
+        )
+        .await;
+        Ok(())
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -485,24 +608,44 @@ impl Channel for BrickChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
-        // The current Brick UX does not surface mid-turn approvals to the
-        // mobile app — the device runs in `autonomy = "supervised"` and any
-        // medium-risk tool would be auto-blocked at the policy layer. Emit
-        // the prompt frame anyway so future apps can opt in; default to
-        // `Deny` so the agent doesn't hang waiting for a response that
-        // will never arrive.
+        // D1/D2: real round-trip. Emit `ApprovalRequest`, register a
+        // oneshot waiter keyed by request_id, await the matching
+        // `ApprovalResponse` from brick-os (which proxies the user's
+        // tap from the mobile app). Times out at APPROVAL_TIMEOUT and
+        // defaults to Deny so the agent doesn't wedge if the mobile
+        // app is offline.
         let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel::<ApprovalDecision>();
+        {
+            let mut pending = self.pending_approvals.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
         self.dispatch(
             OutboundFrame::ApprovalRequest {
                 sender_id: recipient.to_string(),
-                request_id,
+                request_id: request_id.clone(),
                 tool_name: request.tool_name.clone(),
                 arguments_summary: request.arguments_summary.clone(),
             },
             recipient,
         )
         .await;
-        Ok(Some(ChannelApprovalResponse::Deny))
+
+        let decision = match timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(_)) => {
+                warn!(request_id, "brick: approval waiter dropped — defaulting to Deny");
+                ApprovalDecision::Deny
+            }
+            Err(_) => {
+                warn!(request_id, "brick: approval timed out — defaulting to Deny");
+                // Best-effort cleanup so the entry doesn't leak forever.
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(&request_id);
+                ApprovalDecision::Deny
+            }
+        };
+        Ok(Some(ChannelApprovalResponse::from(decision)))
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
@@ -547,6 +690,8 @@ async fn handle_connection(
     inbound_tx: mpsc::Sender<ChannelMessage>,
     daemon_version: String,
     workspace_dir: PathBuf,
+    auth_token: Option<Arc<String>>,
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
 ) -> Result<()> {
     let ws: WebSocketStream<UnixStream> = tokio_tungstenite::accept_async(stream)
         .await
@@ -559,7 +704,12 @@ async fn handle_connection(
         router.register(out_tx.clone())
     };
 
-    // Pump outbound frames serialized as text WS messages.
+    // Pump outbound frames serialized as text WS messages. J1 (plan 3):
+    // each send is wrapped in a 10s timeout — a stuck writer (rare, but
+    // possible under unix-socket back-pressure when apps/os is wedged)
+    // would otherwise block this task forever and leak the connection.
+    // On timeout we drop the connection so the brick-os channel client
+    // reconnects and resyncs from history.
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let payload = match serde_json::to_string(&frame) {
@@ -569,8 +719,17 @@ async fn handle_connection(
                     continue;
                 }
             };
-            if writer.send(WsMessage::Text(payload.into())).await.is_err() {
-                break;
+            let send = writer.send(WsMessage::Text(payload.into()));
+            match tokio::time::timeout(std::time::Duration::from_secs(10), send).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!("brick: ws send error: {e}");
+                    break;
+                }
+                Err(_) => {
+                    warn!("brick: ws send timed out after 10s, dropping connection");
+                    break;
+                }
             }
         }
     });
@@ -583,6 +742,8 @@ async fn handle_connection(
         &inbound_tx,
         &daemon_version,
         &workspace_dir,
+        auth_token.as_deref().map(String::as_str),
+        &pending_approvals,
     )
     .await;
 
@@ -604,7 +765,12 @@ async fn read_loop(
     inbound_tx: &mpsc::Sender<ChannelMessage>,
     daemon_version: &str,
     workspace_dir: &PathBuf,
+    auth_token: Option<&str>,
+    pending_approvals: &Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
 ) -> Result<()> {
+    // J7: when auth is enabled, every frame other than Hello / HelloAuth /
+    // Ping is rejected until the client sends matching `HelloAuth { token }`.
+    let mut authed = auth_token.is_none();
     while let Some(item) = reader.next().await {
         let msg = match item {
             Ok(m) => m,
@@ -637,6 +803,18 @@ async fn read_loop(
             }
         };
 
+        // J7: gate non-handshake frames behind auth when enabled. Hello,
+        // HelloAuth, and Ping are always allowed pre-auth so the client
+        // can complete the handshake and keep connections alive.
+        let pre_auth_allowed = matches!(
+            frame,
+            InboundFrame::Hello { .. } | InboundFrame::HelloAuth { .. } | InboundFrame::Ping
+        );
+        if !authed && !pre_auth_allowed {
+            warn!("brick: dropping pre-auth frame (waiting for HelloAuth)");
+            continue;
+        }
+
         match frame {
             InboundFrame::Hello { client, version: _ } => {
                 debug!(client, "brick: hello from client");
@@ -647,6 +825,23 @@ async fn read_loop(
                         .try_send(OutboundFrame::HelloOk {
                             daemon_version: daemon_version.to_string(),
                         });
+                }
+            }
+            InboundFrame::HelloAuth { token } => {
+                match auth_token {
+                    Some(expected) if expected == token => {
+                        authed = true;
+                        debug!("brick: HelloAuth accepted");
+                    }
+                    Some(_) => {
+                        warn!("brick: HelloAuth token mismatch — closing connection");
+                        break;
+                    }
+                    None => {
+                        // Auth disabled — accept silently for forward
+                        // compat (the client is fine to send it).
+                        authed = true;
+                    }
                 }
             }
             InboundFrame::Message {
@@ -740,16 +935,31 @@ async fn read_loop(
                     });
                 }
             }
-            InboundFrame::ApprovalResponse { .. } => {
-                // Approvals are intentionally a no-op in v1 — see the
-                // doc comment on `request_approval`.
+            InboundFrame::ApprovalResponse {
+                sender_id: _,
+                request_id,
+                decision,
+            } => {
+                // D1/D2: resolve the matching oneshot. If the waiter
+                // was already removed (timeout) or unknown, log and
+                // drop — the agent loop has already moved on.
+                let mut pending = pending_approvals.lock().await;
+                match pending.remove(&request_id) {
+                    Some(tx) => {
+                        if tx.send(decision).is_err() {
+                            debug!(request_id, "brick: approval waiter dropped before resolve");
+                        }
+                    }
+                    None => {
+                        warn!(request_id, "brick: approval response for unknown request_id");
+                    }
+                }
             }
             InboundFrame::HistoryRequest {
                 sender_id,
                 reply_target,
                 thread_ts,
                 limit,
-                before_ts: _,
             } => {
                 // Read from the JSONL `SessionStore` the orchestrator
                 // already writes to via `append_sender_turn`. Key shape
@@ -1128,7 +1338,6 @@ mod tests {
             "reply_target": "conv-42",
             "thread_ts": null,
             "limit": null,
-            "before_ts": null,
         });
         wsx.send(WsMessage::Text(payload.to_string().into()))
             .await
@@ -1157,6 +1366,325 @@ mod tests {
         assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "hi back");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_round_trip_resolves_with_user_decision() {
+        // D1/D2: send ApprovalRequest, register a waiter via
+        // request_approval, simulate the brick-os ApprovalResponse, and
+        // assert the agent loop's caller observes the right decision.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, mut wrx) = ws.split();
+
+        // Identify ourselves as the recipient so request_approval's
+        // dispatch hits *this* connection. The approval router targets
+        // by sender_id (== recipient passed to request_approval).
+        let hello_msg = serde_json::json!({
+            "type": "message",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-approval",
+            "thread_ts": null,
+            "content": "kick",
+            "message_id": "m-1"
+        });
+        wsx.send(WsMessage::Text(hello_msg.to_string().into())).await.unwrap();
+
+        // Spawn the approval request — request_approval blocks until
+        // the waiter resolves. Resolve it from this test by reading the
+        // ApprovalRequest, parsing the request_id, and sending an
+        // ApprovalResponse back.
+        let bc_for_request = bc.clone();
+        let approval_handle = tokio::spawn(async move {
+            bc_for_request
+                .request_approval(
+                    "user1:dev1",
+                    &ChannelApprovalRequest {
+                        tool_name: "shell".to_string(),
+                        arguments_summary: "ls /tmp".to_string(),
+                    },
+                )
+                .await
+        });
+
+        // Pull frames until we see an approval_request, capture its id.
+        let request_id = loop {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("approval_request timeout")
+                .expect("ws closed")
+                .expect("ws err");
+            if let WsMessage::Text(t) = frame
+                && t.contains("\"type\":\"approval_request\"")
+            {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                break v["request_id"].as_str().unwrap().to_string();
+            }
+        };
+
+        // Send the approval response (Approve).
+        let response = serde_json::json!({
+            "type": "approval_response",
+            "sender_id": "user1:dev1",
+            "request_id": request_id,
+            "decision": "approve"
+        });
+        wsx.send(WsMessage::Text(response.to_string().into())).await.unwrap();
+
+        let decision = timeout(Duration::from_secs(2), approval_handle)
+            .await
+            .expect("approval still blocked")
+            .expect("approval task panicked")
+            .expect("approval Result")
+            .expect("approval returned None");
+        assert_eq!(decision, ChannelApprovalResponse::Approve);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_defaults_to_deny_on_timeout() {
+        // D1/D2: when no ApprovalResponse arrives within APPROVAL_TIMEOUT,
+        // request_approval defaults to Deny. We can't sleep 30s here —
+        // assert the path with a manually-completed oneshot drop.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Drop the oneshot sender from the pending registry to simulate
+        // the timeout path's cleanup. request_approval then observes a
+        // dropped sender and defaults to Deny.
+        let bc_for_request = bc.clone();
+        let approval_handle = tokio::spawn(async move {
+            bc_for_request
+                .request_approval(
+                    "user-noconnect:dev",
+                    &ChannelApprovalRequest {
+                        tool_name: "shell".to_string(),
+                        arguments_summary: "rm -rf".to_string(),
+                    },
+                )
+                .await
+        });
+        // Allow request_approval to register its waiter then drop it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut pending = bc.pending_approvals.lock().await;
+            pending.clear();
+        }
+        let decision = approval_handle.await.unwrap().unwrap().unwrap();
+        assert_eq!(decision, ChannelApprovalResponse::Deny);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_call_frames_round_trip_through_brick_channel() {
+        // C3: tool_call_start + tool_call_result emit structured outbound
+        // frames the brick mobile app translates to ToolCallCard.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()));
+        let bc_clone = bc.clone();
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, mut wrx) = ws.split();
+
+        // Associate this connection with the recipient before dispatching.
+        let assoc = serde_json::json!({
+            "type": "message",
+            "sender_id": "user1:dev1",
+            "reply_target": "conv-tool",
+            "thread_ts": null,
+            "content": "go",
+            "message_id": "m-tool-assoc"
+        });
+        wsx.send(WsMessage::Text(assoc.to_string().into())).await.unwrap();
+
+        bc.tool_call_start(
+            "user1:dev1",
+            "draft-tool",
+            Some("toolu_abc"),
+            "shell",
+            r#"{"cmd":"ls /tmp"}"#,
+        )
+        .await
+        .unwrap();
+        bc.tool_call_result("user1:dev1", "draft-tool", Some("toolu_abc"), "shell", true, "ok")
+            .await
+            .unwrap();
+
+        let mut saw_start = false;
+        let mut saw_result = false;
+        for _ in 0..10 {
+            let frame = timeout(Duration::from_secs(2), wrx.next())
+                .await
+                .expect("tool frame timeout")
+                .expect("ws closed")
+                .expect("ws err");
+            if let WsMessage::Text(t) = frame {
+                if t.contains("\"type\":\"tool_call_start\"") {
+                    saw_start = true;
+                    assert!(t.contains("\"tool_name\":\"shell\""));
+                    assert!(t.contains("\"draft_id\":\"draft-tool\""));
+                }
+                if t.contains("\"type\":\"tool_call_result\"") {
+                    saw_result = true;
+                    assert!(t.contains("\"success\":true"));
+                }
+                if saw_start && saw_result {
+                    break;
+                }
+            }
+        }
+        assert!(saw_start && saw_result, "expected both tool_call_start and tool_call_result frames");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn hello_auth_required_when_token_set() {
+        // J7: with auth enabled, frames other than Hello/HelloAuth/Ping
+        // are dropped pre-auth. Sending a Cancel without HelloAuth must
+        // not produce a `/stop` ChannelMessage.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(
+            BrickChannel::new(&sock, 2, dir.path()).with_auth_token("test-token"),
+        );
+        let bc_clone = bc.clone();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The token file should have been written.
+        let token_path = dir.path().join("brick-channel.token");
+        let token_on_disk = std::fs::read_to_string(&token_path).expect("token file");
+        assert_eq!(token_on_disk, "test-token");
+        let mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file perms must be 0600");
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, _wrx) = ws.split();
+
+        // Send Cancel without HelloAuth — should be dropped silently.
+        let cancel = serde_json::json!({
+            "type": "cancel",
+            "sender_id": "u:d",
+            "reply_target": "c",
+            "thread_ts": null,
+            "message_id": "m-cancel"
+        });
+        wsx.send(WsMessage::Text(cancel.to_string().into())).await.unwrap();
+
+        let result = timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(result.is_err(), "pre-auth Cancel must not produce a ChannelMessage");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn hello_auth_unblocks_after_correct_token() {
+        // J7: HelloAuth with the correct token flips authed=true and
+        // subsequent frames are processed.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("zeroclaw.sock");
+        let bc = Arc::new(
+            BrickChannel::new(&sock, 2, dir.path()).with_auth_token("good-token"),
+        );
+        let bc_clone = bc.clone();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        let handle = tokio::spawn(async move {
+            let _ = bc_clone.listen(tx).await;
+        });
+        for _ in 0..50 {
+            if bc.health_check().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let req = "ws://localhost/";
+        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
+            .await
+            .expect("client handshake");
+        let (mut wsx, _wrx) = ws.split();
+
+        let auth = serde_json::json!({"type":"hello_auth","token":"good-token"});
+        wsx.send(WsMessage::Text(auth.to_string().into())).await.unwrap();
+        let cancel = serde_json::json!({
+            "type": "cancel",
+            "sender_id": "u:d",
+            "reply_target": "c",
+            "thread_ts": null,
+            "message_id": "m-after-auth"
+        });
+        wsx.send(WsMessage::Text(cancel.to_string().into())).await.unwrap();
+
+        let cm = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("post-auth Cancel timed out")
+            .expect("rx closed");
+        assert_eq!(cm.content, "/stop");
+        assert_eq!(cm.id, "m-after-auth");
 
         handle.abort();
     }
@@ -1203,7 +1731,6 @@ mod tests {
             "reply_target": "room1",
             "thread_ts": null,
             "limit": 2,
-            "before_ts": null,
         });
         wsx.send(WsMessage::Text(payload.to_string().into()))
             .await

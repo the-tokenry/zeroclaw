@@ -3044,6 +3044,49 @@ async fn process_channel_message(
                                 tracing::debug!("Draft update failed: {e}");
                             }
                         }
+                        // C3 (brick plan 3): forward structured tool
+                        // events to channels with rich UIs. Default
+                        // trait impl is a no-op so non-brick channels
+                        // keep relying on the human-readable Status
+                        // text emitted alongside.
+                        StreamDelta::ToolStart {
+                            tool_id,
+                            tool_name,
+                            arguments_json,
+                        } => {
+                            if let Err(e) = channel
+                                .tool_call_start(
+                                    &reply_target,
+                                    &draft_id,
+                                    tool_id.as_deref(),
+                                    &tool_name,
+                                    &arguments_json,
+                                )
+                                .await
+                            {
+                                tracing::debug!("tool_call_start forward failed: {e}");
+                            }
+                        }
+                        StreamDelta::ToolResult {
+                            tool_id,
+                            tool_name,
+                            success,
+                            output,
+                        } => {
+                            if let Err(e) = channel
+                                .tool_call_result(
+                                    &reply_target,
+                                    &draft_id,
+                                    tool_id.as_deref(),
+                                    &tool_name,
+                                    success,
+                                    &output,
+                                )
+                                .await
+                            {
+                                tracing::debug!("tool_call_result forward failed: {e}");
+                            }
+                        }
                     }
                 }
             }))

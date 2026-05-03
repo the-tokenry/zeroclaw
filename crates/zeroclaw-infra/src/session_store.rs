@@ -40,6 +40,11 @@ impl SessionStore {
 
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.
+    ///
+    /// J3 (plan 3): malformed lines are logged at WARN with a byte
+    /// offset hint and a per-load summary so on-device session
+    /// corruption surfaces in journald instead of disappearing as zero
+    /// loaded messages.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let path = self.session_path(session_key);
         let file = match std::fs::File::open(&path) {
@@ -49,16 +54,52 @@ impl SessionStore {
 
         let reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
+        let mut skipped: usize = 0;
+        let mut byte_offset: u64 = 0;
 
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_key,
+                        line_no = line_no,
+                        byte_offset,
+                        "session_store: read error: {e}",
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // +1 for the newline stripped by `lines()`.
+            let line_len = line.len() as u64 + 1;
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                byte_offset += line_len;
                 continue;
             }
-            if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
-                messages.push(msg);
+            match serde_json::from_str::<ChatMessage>(trimmed) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_key,
+                        line_no = line_no,
+                        byte_offset,
+                        "session_store: skipped malformed JSONL line: {e}",
+                    );
+                    skipped += 1;
+                }
             }
+            byte_offset += line_len;
+        }
+
+        if skipped > 0 {
+            tracing::warn!(
+                session = %session_key,
+                loaded = messages.len(),
+                skipped,
+                "session_store: load completed with malformed lines",
+            );
         }
 
         messages
