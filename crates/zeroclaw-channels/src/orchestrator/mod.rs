@@ -1801,18 +1801,16 @@ fn brick_resolve_set_model<'a>(
     routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
 ) -> BrickSetModelResolution<'a> {
     let after_hint = raw_model.strip_prefix("hint:").unwrap_or(raw_model);
-    let stripped = after_hint
-        .strip_prefix("litellm/")
-        .unwrap_or(after_hint);
+    let stripped = after_hint.strip_prefix("litellm/").unwrap_or(after_hint);
     let full = stripped.to_string();
     let bare = match full.find('/') {
         Some(i) => full[i + 1..].to_string(),
         None => full.clone(),
     };
     let route = routes.iter().find(|r| {
-        [full.as_str(), bare.as_str()].iter().any(|c| {
-            r.model.eq_ignore_ascii_case(c) || r.hint.eq_ignore_ascii_case(c)
-        })
+        [full.as_str(), bare.as_str()]
+            .iter()
+            .any(|c| r.model.eq_ignore_ascii_case(c) || r.hint.eq_ignore_ascii_case(c))
     });
     BrickSetModelResolution {
         route,
