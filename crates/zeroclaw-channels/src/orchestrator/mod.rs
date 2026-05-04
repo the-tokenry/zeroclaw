@@ -1780,6 +1780,46 @@ fn build_config_block_kit(
     blocks.to_string()
 }
 
+/// Brick-fork divergence (vendor/PATCHES.md): outcome of the `/model`
+/// runtime command's route lookup. The brick channel client always sends
+/// `/model hint:<id>` over the wire, where `<id>` may carry a slot prefix
+/// (`anthropic/claude-sonnet-4-6`) or a `litellm/` mux marker. This helper
+/// strips those wire prefixes and tries to match against both the full
+/// slot-prefixed id and the bare suffix so existing TOML rows whose
+/// `hint`/`model` fields are bare keep working alongside any future rows
+/// that carry the slot prefix.
+struct BrickSetModelResolution<'a> {
+    /// Matched route, if any.
+    route: Option<&'a zeroclaw_config::schema::ModelRouteConfig>,
+    /// Wire-prefix-stripped model id. Used as the fallback `current.model`
+    /// when no route matched (preserves the current provider).
+    stripped_model: String,
+}
+
+fn brick_resolve_set_model<'a>(
+    raw_model: &str,
+    routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+) -> BrickSetModelResolution<'a> {
+    let after_hint = raw_model.strip_prefix("hint:").unwrap_or(raw_model);
+    let stripped = after_hint
+        .strip_prefix("litellm/")
+        .unwrap_or(after_hint);
+    let full = stripped.to_string();
+    let bare = match full.find('/') {
+        Some(i) => full[i + 1..].to_string(),
+        None => full.clone(),
+    };
+    let route = routes.iter().find(|r| {
+        [full.as_str(), bare.as_str()].iter().any(|c| {
+            r.model.eq_ignore_ascii_case(c) || r.hint.eq_ignore_ascii_case(c)
+        })
+    });
+    BrickSetModelResolution {
+        route,
+        stripped_model: full,
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -1834,15 +1874,13 @@ async fn handle_runtime_command_if_needed(
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
-                // Resolve provider+model from model_routes (match by model name or hint)
-                if let Some(route) = ctx.model_routes.iter().find(|r| {
-                    r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
-                }) {
+                let resolution = brick_resolve_set_model(&model, ctx.model_routes.as_ref());
+                if let Some(route) = resolution.route {
                     current.provider = route.provider.clone();
                     current.model = route.model.clone();
                     current.api_key = route.api_key.clone();
                 } else {
-                    current.model = model.clone();
+                    current.model = resolution.stripped_model;
                 }
                 set_route_selection(ctx, &sender_key, current.clone());
 
@@ -6155,6 +6193,106 @@ mod tests {
         assert_eq!(
             channel_message_timeout_budget_secs_with_cap(300, 10, 1),
             300
+        );
+    }
+
+    // Brick-fork SetModel route resolution. The brick channel client wraps
+    // every model id in a `hint:` wire prefix and may pass slot-prefixed
+    // ids (`anthropic/claude-sonnet-4-6`) or `litellm/<id>` mux markers.
+    // Existing TOML rows written by `apps/os/src/zeroclaw/apply-zeroclaw-config.ts`
+    // use bare `hint`/`model` fields. The resolver must strip the wire
+    // prefix and try both the full slot-prefixed id and the bare suffix
+    // so chat routing picks the right provider profile.
+    fn anthropic_route() -> zeroclaw_config::schema::ModelRouteConfig {
+        zeroclaw_config::schema::ModelRouteConfig {
+            hint: "claude-sonnet-4-6".into(),
+            provider: "anthropic-custom:https://api.brick.thetokenry.com/v1/llm/anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            api_key: None,
+        }
+    }
+
+    fn google_route_slot_prefixed() -> zeroclaw_config::schema::ModelRouteConfig {
+        zeroclaw_config::schema::ModelRouteConfig {
+            hint: "gemini-2.5-pro".into(),
+            provider: "custom:https://api.brick.thetokenry.com/v1/llm".into(),
+            // Per Fix A, the unified LiteLLM proxy keeps the slot prefix in
+            // the route's `model` field so LiteLLM finds the registered
+            // model_name (e.g. `google/gemini-2.5-pro`).
+            model: "google/gemini-2.5-pro".into(),
+            api_key: None,
+        }
+    }
+
+    #[test]
+    fn brick_resolve_set_model_strips_hint_prefix_and_matches_bare_route() {
+        let routes = vec![anthropic_route()];
+        // Brick OS wire form: `/model hint:<slot-prefixed-id>`.
+        let resolution = brick_resolve_set_model("hint:anthropic/claude-sonnet-4-6", &routes);
+        let route = resolution
+            .route
+            .expect("must match the anthropic-custom route by bare suffix");
+        assert_eq!(
+            route.provider,
+            "anthropic-custom:https://api.brick.thetokenry.com/v1/llm/anthropic"
+        );
+        assert_eq!(route.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn brick_resolve_set_model_matches_full_slot_prefixed_id() {
+        // No `hint:` wrapper. Same routing decision via the full id.
+        let routes = vec![google_route_slot_prefixed()];
+        let resolution = brick_resolve_set_model("google/gemini-2.5-pro", &routes);
+        let route = resolution
+            .route
+            .expect("must match the unified LiteLLM route by `model` field");
+        assert_eq!(
+            route.provider,
+            "custom:https://api.brick.thetokenry.com/v1/llm"
+        );
+        assert_eq!(route.model, "google/gemini-2.5-pro");
+    }
+
+    #[test]
+    fn brick_resolve_set_model_strips_litellm_mux_prefix() {
+        // Some callers may send `litellm/<id>` (the cloud catalog's
+        // disambiguator for LiteLLM-only models). The resolver must peel
+        // it the same way `cloud/src/llm/wrapper.ts::normalizeUpstreamModel`
+        // does so route lookup matches.
+        let routes = vec![google_route_slot_prefixed()];
+        let resolution = brick_resolve_set_model("litellm/google/gemini-2.5-pro", &routes);
+        let route = resolution
+            .route
+            .expect("must match after stripping the litellm/ mux prefix");
+        assert_eq!(
+            route.provider,
+            "custom:https://api.brick.thetokenry.com/v1/llm"
+        );
+    }
+
+    #[test]
+    fn brick_resolve_set_model_no_match_returns_stripped_model_for_fallback() {
+        // Unknown model id with the wire prefix. No route matches; the
+        // SetModel arm should keep the current provider but write the
+        // stripped id (no `hint:` / `litellm/` polluting downstream
+        // provider chains).
+        let routes = vec![anthropic_route()];
+        let resolution = brick_resolve_set_model("hint:litellm/together_ai/foo", &routes);
+        assert!(resolution.route.is_none());
+        assert_eq!(resolution.stripped_model, "together_ai/foo");
+    }
+
+    #[test]
+    fn brick_resolve_set_model_route_field_comparisons_are_case_insensitive() {
+        // Route fields use `.eq_ignore_ascii_case`, so the user typing
+        // `/model CLAUDE-SONNET-4-6` (or any case) still hits the route
+        // whose `hint`/`model` is lowercase `claude-sonnet-4-6`.
+        let routes = vec![anthropic_route()];
+        let res = brick_resolve_set_model("hint:anthropic/CLAUDE-SONNET-4-6", &routes);
+        assert!(
+            res.route.is_some(),
+            "route field comparisons are case-insensitive"
         );
     }
 
