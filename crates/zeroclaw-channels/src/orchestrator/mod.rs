@@ -2960,11 +2960,33 @@ async fn process_channel_message(
                 "kind": format!("{kind:?}"),
             }),
         );
-        println!(
+        let display_text = format!(
             "  🤖 No reply [{kind:?}] ({}ms): {}",
             started_at.elapsed().as_millis(),
             reason.as_deref().unwrap_or("no reason provided")
         );
+        println!("{display_text}");
+        if let Some(channel) = target_channel.as_ref() {
+            let kind_wire = match kind {
+                NoReplyKind::Informational => "informational",
+                NoReplyKind::Refused => "refused",
+                NoReplyKind::Failed => "failed",
+            };
+            if let Err(e) = channel
+                .notify_no_reply(
+                    &msg.reply_target,
+                    &msg.sender,
+                    &msg.id,
+                    kind_wire,
+                    reason.as_deref(),
+                    started_at.elapsed().as_millis() as u64,
+                    &display_text,
+                )
+                .await
+            {
+                tracing::debug!("notify_no_reply failed on {}: {e}", channel.name());
+            }
+        }
         return;
     }
 

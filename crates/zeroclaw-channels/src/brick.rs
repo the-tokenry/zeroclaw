@@ -200,6 +200,17 @@ pub enum OutboundFrame {
         thread_ts: Option<String>,
         model: Option<String>,
     },
+    /// Terminal outcome: reply-intent precheck returned NO_REPLY. Brick-os
+    /// maps this to a relay `ChatEventPayload` so the app does not watchdog-timeout.
+    NoReply {
+        sender_id: String,
+        message_id: String,
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        elapsed_ms: u64,
+        display_text: String,
+    },
     Pong,
 }
 
@@ -278,11 +289,7 @@ impl Router {
             // connection so the brick-os process at the other end always
             // sees its own draft updates even before it has issued a
             // `message` frame on this connection.
-            return self
-                .connections
-                .values()
-                .map(|e| e.tx.clone())
-                .collect();
+            return self.connections.values().map(|e| e.tx.clone()).collect();
         };
         ids.iter()
             .filter_map(|id| self.connections.get(id))
@@ -543,12 +550,7 @@ impl Channel for BrickChannel {
         Ok(Some(draft_id))
     }
 
-    async fn update_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         self.dispatch(
             OutboundFrame::DraftDelta {
                 draft_id: message_id.to_string(),
@@ -621,12 +623,7 @@ impl Channel for BrickChannel {
         Ok(())
     }
 
-    async fn finalize_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         self.dispatch(
             OutboundFrame::DraftFinalize {
                 draft_id: message_id.to_string(),
@@ -642,6 +639,31 @@ impl Channel for BrickChannel {
         self.dispatch(
             OutboundFrame::DraftCancel {
                 draft_id: message_id.to_string(),
+            },
+            recipient,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn notify_no_reply(
+        &self,
+        recipient: &str,
+        sender_id: &str,
+        user_message_id: &str,
+        kind: &str,
+        reason: Option<&str>,
+        elapsed_ms: u64,
+        display_text: &str,
+    ) -> Result<()> {
+        self.dispatch(
+            OutboundFrame::NoReply {
+                sender_id: sender_id.to_string(),
+                message_id: user_message_id.to_string(),
+                kind: kind.to_string(),
+                reason: reason.map(str::to_string),
+                elapsed_ms,
+                display_text: display_text.to_string(),
             },
             recipient,
         )
@@ -680,7 +702,10 @@ impl Channel for BrickChannel {
         let decision = match timeout(APPROVAL_TIMEOUT, rx).await {
             Ok(Ok(d)) => d,
             Ok(Err(_)) => {
-                warn!(request_id, "brick: approval waiter dropped — defaulting to Deny");
+                warn!(
+                    request_id,
+                    "brick: approval waiter dropped — defaulting to Deny"
+                );
                 ApprovalDecision::Deny
             }
             Err(_) => {
@@ -869,11 +894,9 @@ async fn read_loop(
                 debug!(client, "brick: hello from client");
                 let r = router.lock().await;
                 if let Some(entry) = r.connections.get(&conn_id) {
-                    let _ = entry
-                        .tx
-                        .try_send(OutboundFrame::HelloOk {
-                            daemon_version: daemon_version.to_string(),
-                        });
+                    let _ = entry.tx.try_send(OutboundFrame::HelloOk {
+                        daemon_version: daemon_version.to_string(),
+                    });
                 }
             }
             InboundFrame::HelloAuth { token } => {
@@ -1027,7 +1050,10 @@ async fn read_loop(
                         }
                     }
                     None => {
-                        warn!(request_id, "brick: approval response for unknown request_id");
+                        warn!(
+                            request_id,
+                            "brick: approval response for unknown request_id"
+                        );
                     }
                 }
             }
@@ -1303,6 +1329,20 @@ mod tests {
         let s = serde_json::to_string(&progress).unwrap();
         assert!(s.contains("\"type\":\"tool_progress\""));
 
+        let no_reply = OutboundFrame::NoReply {
+            sender_id: "u:d".into(),
+            message_id: "m1".into(),
+            kind: "informational".into(),
+            reason: Some("because".into()),
+            elapsed_ms: 42,
+            display_text: "  🤖 No reply [Informational] (42ms): because".into(),
+        };
+        let s = serde_json::to_string(&no_reply).unwrap();
+        assert!(s.contains("\"type\":\"no_reply\""));
+        assert!(s.contains("\"message_id\":\"m1\""));
+        assert!(s.contains("\"kind\":\"informational\""));
+        assert!(s.contains("\"elapsed_ms\":42"));
+
         let history = OutboundFrame::HistoryResponse {
             sender_id: "u:d".into(),
             reply_target: "conv1".into(),
@@ -1485,7 +1525,9 @@ mod tests {
             "content": "kick",
             "message_id": "m-1"
         });
-        wsx.send(WsMessage::Text(hello_msg.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(hello_msg.to_string().into()))
+            .await
+            .unwrap();
 
         // Spawn the approval request — request_approval blocks until
         // the waiter resolves. Resolve it from this test by reading the
@@ -1526,7 +1568,9 @@ mod tests {
             "request_id": request_id,
             "decision": "approve"
         });
-        wsx.send(WsMessage::Text(response.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(response.to_string().into()))
+            .await
+            .unwrap();
 
         let decision = timeout(Duration::from_secs(2), approval_handle)
             .await
@@ -1621,7 +1665,9 @@ mod tests {
             "content": "go",
             "message_id": "m-tool-assoc"
         });
-        wsx.send(WsMessage::Text(assoc.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(assoc.to_string().into()))
+            .await
+            .unwrap();
 
         bc.tool_call_start(
             "user1:dev1",
@@ -1632,9 +1678,16 @@ mod tests {
         )
         .await
         .unwrap();
-        bc.tool_call_result("user1:dev1", "draft-tool", Some("toolu_abc"), "shell", true, "ok")
-            .await
-            .unwrap();
+        bc.tool_call_result(
+            "user1:dev1",
+            "draft-tool",
+            Some("toolu_abc"),
+            "shell",
+            true,
+            "ok",
+        )
+        .await
+        .unwrap();
 
         let mut saw_start = false;
         let mut saw_result = false;
@@ -1659,7 +1712,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_start && saw_result, "expected both tool_call_start and tool_call_result frames");
+        assert!(
+            saw_start && saw_result,
+            "expected both tool_call_start and tool_call_result frames"
+        );
 
         handle.abort();
     }
@@ -1671,9 +1727,7 @@ mod tests {
         // not produce a `/stop` ChannelMessage.
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("zeroclaw.sock");
-        let bc = Arc::new(
-            BrickChannel::new(&sock, 2, dir.path()).with_auth_token("test-token"),
-        );
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()).with_auth_token("test-token"));
         let bc_clone = bc.clone();
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
         let handle = tokio::spawn(async move {
@@ -1708,10 +1762,15 @@ mod tests {
             "thread_ts": null,
             "message_id": "m-cancel"
         });
-        wsx.send(WsMessage::Text(cancel.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(cancel.to_string().into()))
+            .await
+            .unwrap();
 
         let result = timeout(Duration::from_millis(300), rx.recv()).await;
-        assert!(result.is_err(), "pre-auth Cancel must not produce a ChannelMessage");
+        assert!(
+            result.is_err(),
+            "pre-auth Cancel must not produce a ChannelMessage"
+        );
 
         handle.abort();
     }
@@ -1722,9 +1781,7 @@ mod tests {
         // subsequent frames are processed.
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("zeroclaw.sock");
-        let bc = Arc::new(
-            BrickChannel::new(&sock, 2, dir.path()).with_auth_token("good-token"),
-        );
+        let bc = Arc::new(BrickChannel::new(&sock, 2, dir.path()).with_auth_token("good-token"));
         let bc_clone = bc.clone();
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
         let handle = tokio::spawn(async move {
@@ -1745,7 +1802,9 @@ mod tests {
         let (mut wsx, _wrx) = ws.split();
 
         let auth = serde_json::json!({"type":"hello_auth","token":"good-token"});
-        wsx.send(WsMessage::Text(auth.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(auth.to_string().into()))
+            .await
+            .unwrap();
         let cancel = serde_json::json!({
             "type": "cancel",
             "sender_id": "u:d",
@@ -1753,7 +1812,9 @@ mod tests {
             "thread_ts": null,
             "message_id": "m-after-auth"
         });
-        wsx.send(WsMessage::Text(cancel.to_string().into())).await.unwrap();
+        wsx.send(WsMessage::Text(cancel.to_string().into()))
+            .await
+            .unwrap();
 
         let cm = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1776,7 +1837,9 @@ mod tests {
             let store = SessionStore::new(dir.path()).expect("session store");
             let key = "brick_room1_alice:dev1";
             for i in 0..5 {
-                store.append(key, &ChatMessage::user(format!("m{i}"))).unwrap();
+                store
+                    .append(key, &ChatMessage::user(format!("m{i}")))
+                    .unwrap();
             }
         }
 

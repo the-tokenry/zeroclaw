@@ -222,6 +222,24 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Brick fork: after reply-intent precheck chose `NO_REPLY`, surface a
+    /// terminal wire event to the device bridge. `recipient` is the channel
+    /// routing key (`reply_target`); `sender_id` is the inbound user id
+    /// (`userId:deviceId`). `display_text` is formatted by the orchestrator
+    /// and must be shown verbatim in the app.
+    async fn notify_no_reply(
+        &self,
+        _recipient: &str,
+        _sender_id: &str,
+        _user_message_id: &str,
+        _kind: &str,
+        _reason: Option<&str>,
+        _elapsed_ms: u64,
+        _display_text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Add a reaction (emoji) to a message.
     async fn add_reaction(
         &self,
