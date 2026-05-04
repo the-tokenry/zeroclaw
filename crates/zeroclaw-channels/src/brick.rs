@@ -280,21 +280,22 @@ impl Router {
         }
     }
 
-    /// Snapshot of senders for a given recipient — the lookup key in
-    /// `send()` is the `SendMessage::recipient` we previously echoed in
-    /// `ChannelMessage::sender`.
+    /// Brick is a single-device unix-socket channel — at most a couple
+    /// of connections, all owned by the brick-os process on the same
+    /// device. There is no multi-tenant routing here, so always broadcast
+    /// every outbound frame to every live connection. The `recipient`
+    /// argument is intentionally ignored: the daemon orchestrator
+    /// dispatches with `recipient = msg.reply_target` (the conversation
+    /// id), but brick-os connections register themselves under
+    /// `sender_id` (`<userId>:<deviceId>`), and the previous keyed lookup
+    /// silently dropped reply frames whose recipient key didn't match
+    /// any registered sender_id (the broadcast fallback was supposed to
+    /// catch this but a subtle race during the message→reply window
+    /// could still elide frames). Always-broadcast is correct for this
+    /// channel topology and makes the dispatch path unconditional.
+    #[allow(unused_variables)]
     fn senders_for(&self, recipient: &str) -> Vec<mpsc::Sender<OutboundFrame>> {
-        let Some(ids) = self.by_sender.get(recipient) else {
-            // Broadcast: no specific subscriber — fan out to every
-            // connection so the brick-os process at the other end always
-            // sees its own draft updates even before it has issued a
-            // `message` frame on this connection.
-            return self.connections.values().map(|e| e.tx.clone()).collect();
-        };
-        ids.iter()
-            .filter_map(|id| self.connections.get(id))
-            .map(|e| e.tx.clone())
-            .collect()
+        self.connections.values().map(|e| e.tx.clone()).collect()
     }
 }
 
