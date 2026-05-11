@@ -158,6 +158,14 @@ pub struct CronJob {
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
+    /// Optional named agent profile this cron should run under. When set,
+    /// the scheduler resolves `[agents.<agent_id>]` from `config.agents`
+    /// at fire time and runs the agent loop with that profile's
+    /// `system_prompt`, `model`, `memory_namespace`, and `allowed_tools`.
+    /// When unset, the cron runs as the daemon's default profile (today's
+    /// behavior — backward compatible with existing single-agent crons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
@@ -189,6 +197,12 @@ pub struct CronJobPatch {
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
+    /// Patch the optional named agent profile binding (Brick multi-agent).
+    /// Use `Some(Some(id))` to set, `Some(None)` to clear, `None` to leave
+    /// unchanged. Serde's default flattening keeps the field optional in
+    /// JSON so existing patch payloads parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Option<String>>,
 }
 
 #[cfg(test)]

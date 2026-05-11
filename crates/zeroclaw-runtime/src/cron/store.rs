@@ -518,6 +518,12 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         delete_after_run: row.get::<_, i64>(11)? != 0,
         source: source.unwrap_or_else(|| "imperative".to_string()),
         uses_memory: uses_memory != Some(0),
+        // agent_id persistence in the SQLite cron_jobs table is a follow-up
+        // (would require ALTER TABLE migration). For now, agent-bound crons
+        // round-trip through the in-memory CronJob struct only — the cron
+        // store loses the binding across restart. The cron scheduler still
+        // honors `agent_id` when present at fire time within a single run.
+        agent_id: None,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {

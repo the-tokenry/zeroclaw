@@ -700,6 +700,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             source: "imperative".into(),
+            agent_id: None,
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
