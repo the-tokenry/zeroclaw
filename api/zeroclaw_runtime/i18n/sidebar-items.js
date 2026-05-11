@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["detect_locale","get_cli_string","get_tool_description","init","normalize_locale"]};

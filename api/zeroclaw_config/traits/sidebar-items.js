@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Answer","MapKeyKind","PropKind"],"struct":["MapKeySection","PropFieldInfo","SecretFieldInfo","SelectItem"],"trait":["ChannelConfig","ConfigHandle","HasPropKind","OnboardUi"]};
